@@ -1,0 +1,2160 @@
+---
+title: "MUDS Marr Exercise"
+output: 
+  html_notebook: 
+    toc: yes
+    toc_depth: 4
+author: Henrietta Holze
+date: "21 November 2024"
+---
+
+## Task description
+
+In a 2019 publication (doi:10.1016/j.cell.2019.01.031), Peter van Galen and colleagues analyzed transcriptomic profiles of bone marrow aspirates from 16 AML patients and five healthy donors.
+
+Your first task in this exercise is to provide a concise overview of the dataset, including summary statistics such as the composition of cell-type frequencies across donors and a visualization of the data in two dimensions (e.g., using UMAP or t-SNE embeddings). 
+
+An interesting feature of the dataset is the availability of labels distinguishing malignant and non-malignant single cells. The second task is to exploit these labels to build a suitable ML classifier that predicts the normal or malignant identity of single cells. 
+Please detail on how your classifier works, whether it is interpretable, its performance, and the train-test split you use for your machine learning experiment.  
+
+
+### Relevance of the problem
+
+**Task 1**
+
+It is important to get a good understanding of a dataset before training any kind of machine learning algorithm on it. 
+Important factors to be aware of are biases in the data, in particular, biases in the patient metadata.  
+Furthermore, the quality of the data has to be assessed, such as sample and cell quality.  
+Lastly, transcriptomics data is highly dimensional and in order to recognize patterns in the data, it is useful to embed the data into a 2D space that can be visualized. 
+Embedding of data into a lower dimensional space, e.g. via PCA, also serves to remove noise.
+
+**Task 2**
+
+Depending on disease burden, there are healthy and malignant cells present in the bone marrow of patients with AML.  
+In order to investigate disease mechanisms of AML, we need to be able to clearly differentiate between healthy and malignant cells. 
+Only then, we can look at what biological processes in cell differentiation are disrupted. 
+The differentiation is also important to identify treatment targets that do not kill the remaining healthy HSPCs.  
+Particularly in MRD samples it is very important to identify the subset of malignant cells that is resistant/tolerant to treatment.  
+In AML, healthy and malignant progenitor and myeloid cells are not distinguishable by cell surface markers i.e., it is not possible to isolate healthy/malignant cells by FACS (yet).  
+Thus, scRNA-seq data of AML BM samples contain both groups of cells and we have thus far not been able to distinguish them based on their transcriptome.
+
+Van Galen et al. employed a novel technology to genotype a subset of cells present in the scRNA-seq data and used these genotyped cells to build a classifier to distinguish the bulk of the cells into malignant and non-malignant cells.  
+However, sc genotyping comes at an extra cost and labor and is not available for all datasets. 
+Therefore, it would be extremely useful to have a general classifier of normal vs. malignant cells in AML samples, that is applicable to other scRNA-seq datasets. 
+
+### van Galen 2019 dataset
+
+[Paper](https://www.cell.com/cell/fulltext/S0092-8674(19)30094-7)
+
+[Original analysis of the data](https://github.com/BernsteinLab/aml2019)
+
+[Re-analysis of data](https://github.com/petervangalen/reanalyze-aml2019)
+
+Data downloaded with `wget https://www.dropbox.com/s/399x045zc57fiut/Seurat_AML.rds`
+
+MUTZ-3 and OCI-AML3 are AML cell lines.
+
+BM samples are from healthy donors. 
+Cells from one healthy donor were sorted for CD34+ (HSPCs) and CD34+CD38- (HSCs), to enrich for rare early progenitor populations.
+
+All other samples are from patients diagnosed with AML, with different driver mutations. 
+
+AML samples were collected at day 0 and for a subset of samples at different time points post diagnosis (and post chemo).
+
+## Task 1: Exploratory data analysis
+
+```{r results=F}
+library(readxl)
+library(Seurat)
+library(tidyverse)
+library(chameleon)
+library(randomForest)
+```
+
+
+<!-- ```{r} -->
+<!-- # library("reticulate") -->
+<!-- # py_install("python-igraph") -->
+<!-- # py_install("leidenalg", forge = TRUE) -->
+<!-- # install.packages("leiden") -->
+<!-- ``` -->
+
+### Preprocess metadata
+
+Load scRNA-seq data object and metadata. 
+
+```{r}
+galen_aml <- readRDS("reanalyze-aml2019/Seurat_AML.rds")
+donor_metadata <-
+  readxl::read_xlsx(
+    "ScienceDirect_files_21Nov2024_08-09-30.987/1-s2.0-S0092867419300947-mmc1.xlsx"
+  )
+```
+
+Load HSPC cell types annotated by backspin cluster and add to metadata of Seurat object.
+From [aml2019 github repo](https://github.com/BernsteinLab/aml2019/tree/master).
+
+```{r results=F}
+backspin_celltypes <-
+  read_tsv("aml2019/04 Random forest classifier/BM_6915cells.BackSPIN.txt")
+
+backspin_celltypes <-
+  column_to_rownames(backspin_celltypes, var = "cell") %>% dplyr::rename(backspin_celltype = cluster)
+rownames(backspin_celltypes) <- gsub("-", "\\.", rownames(backspin_celltypes))
+
+galen_aml <- AddMetaData(galen_aml, metadata = backspin_celltypes)
+```
+
+
+```{r}
+head(galen_aml@meta.data)
+head(donor_metadata)
+```
+
+Metadata included in Seurat object
+- orig.ident (patient ID + day from diagnosis)
+- NumberOfReads
+- CyclingScore
+- CyclingBinary
+- MutTranscripts (number of transcript for wt allele)
+- WtTranscripts (number of transcript for mutated allele)
+- PredictionRefined (classification of cells into malignant, healthy and uncertain)
+- CellType (classification into 21 healthy and malignant cell types)
+- nCount_RNA
+- nFeature_RNA
+
+
+Remove cells and metadata associated to cell lines.
+
+```{r}
+galen_aml$SampleClass <-
+  ifelse(
+    grepl("BM", galen_aml$orig.ident),
+    "HealthyDonor",
+    ifelse(
+      grepl("OCI.AML3|MUTZ3", galen_aml$orig.ident),
+      "CellLine",
+      "AmlDonor"
+    )
+  )
+galen_aml_donors <- subset(galen_aml, SampleClass != "CellLine")
+
+donor_metadata <- donor_metadata %>%
+  filter(!Sample %in% c("OCI-AML3", "MUTZ3"))
+```
+
+Correct value in blast count metadata. 
+"1% (76% promono-cytes)" is considered as blast count of 76% in the paper (Fig. 2b).
+
+```{r}
+donor_metadata$`Blast count` <-
+  as.numeric(gsub("<5\\%", "0.05", gsub(
+    "<1\\%",
+    "0.01",
+    gsub(".*76\\%.*", "0.76", donor_metadata$`Blast count`)
+  )))
+donor_metadata$Age <- as.numeric(donor_metadata$Age)
+```
+
+
+Merge donor metadata into Seurat object metadata.
+
+```{r}
+# match sample ID between Seurat object and metadata table
+donor_metadata <- donor_metadata %>%
+  mutate(SampleId = gsub("CD", "", gsub(" ", "\\.", gsub(
+    "\\+", "p", gsub("-", "n", Sample)
+  )))) %>%
+  mutate(SampleId = ifelse(
+    grepl("BM", SampleId),
+    SampleId,
+    paste(SampleId, `Days from diagnosis`, sep = ".")
+  ))
+
+# merge into seurat object metadata, preserve order of cells
+tmp <-
+  merge(
+    rownames_to_column(galen_aml_donors@meta.data),
+    donor_metadata,
+    by.x = "orig.ident",
+    by.y = "SampleId",
+    all.x = T
+  )
+tmp <- column_to_rownames(tmp, "rowname")
+galen_aml_donors@meta.data <- tmp[colnames(galen_aml_donors),]
+```
+
+
+### Sex distribution
+
+Tettero, J.M., Cloos, J. & Bullinger, L. Acute myeloid leukemia: does sex matter?. Leukemia 38, 2329–2331 (2024). [https://doi.org/10.1038/s41375-024-02435-z](https://www.nature.com/articles/s41375-024-02435-z/tables/1)
+    
+AML is more frequent in males (ca. 4.5 per 100,000) vs females (ca. 3.0 per 100,000).
+A number of studies showing differences in treatment response in males and females demonstrates the importance to consider sex.
+
+The van Galen dataset only has male healthy donors and is biased towards male AML donors (62.5%). 
+Slightly more pronounced when considering AML samples (66.7%).
+
+Only cells from healthy donors and genotyped malignant cells from AML cells were used for training the malignant vs. normal classifier. 
+I.e., all healthy cells in the training data were male.  
+This would usually result in a classification of all female cells as AML cells. However, there is also a male AML samples with loss of Y (AML707B), which makes sex more ambiguously linked to malignant status. 
+Furthermore, expression of sex-specific genes could be low/sparse, and not all cells might be distinguishable by sex based on their expression.
+
+```{r fig.height=3, fig.width=6}
+# donors
+p1 <- donor_metadata %>%
+  select(Sample, Gender) %>%
+  mutate(Sample = gsub(" .*", "", Sample)) %>%
+  unique() %>%
+  mutate(Group = ifelse(grepl("BM", Sample), "Healthy", "AML")) %>%
+  group_by(Group, Gender) %>%
+  summarize(n_donors = n()) %>%
+  ggplot(aes(fill = Gender, y = n_donors, x = Group)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "None",
+    panel.grid = element_blank()
+  )
+
+# samples
+p2 <- donor_metadata %>%
+  select(Sample, `Days from diagnosis`, Gender) %>%
+  unique() %>%
+  mutate(Group = ifelse(grepl("BM", Sample), "Healthy", "AML")) %>%
+  group_by(Group, Gender) %>%
+  summarize(n_samples = n()) %>%
+  ggplot(aes(fill = Gender, y = n_samples, x = Group)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggpubr::ggarrange(p1, p2, align = "h", widths = c(1, 1.3))
+```
+
+
+### Cancer driver mutations
+
+Plot which sample has which cancer driver gene mutated (see Fig. 2B).  
+AML722B BCOR in paper Fig. 2b but not in supplementary metadata.  
+All samples have a unique combination of mutations. 
+
+```{r}
+sample_mutation_matrix <- donor_metadata %>%
+  filter(
+    !`RHP Mutations` %in% c("Not performed", "None Detected", "Unknown", "NA") &
+      !is.na(`RHP Mutations`)
+  ) %>%
+  mutate(driver_mutations = `RHP Mutations`) %>%
+  separate_longer_delim(cols = driver_mutations, "/// ") %>%
+  mutate(driver_mutations = gsub(" .*", "", driver_mutations)) %>%
+  # unique for samples with multiple mutations in same gene
+  unique() %>%
+  # count number of samples for each gene and sort by that
+  group_by(driver_mutations) %>%
+  mutate(n_samples = n()) %>%
+  arrange(desc(n_samples)) %>%
+  mutate(value = 1)
+
+sample_mutation_matrix <- sample_mutation_matrix %>%
+  mutate(
+    driver_mutations = factor(
+      driver_mutations,
+      levels = unique(sample_mutation_matrix$driver_mutations),
+      ordered = T
+    ),
+    Sample = factor(
+      Sample,
+      level = unique(sample_mutation_matrix$Sample),
+      ordered = T
+    )
+  )
+
+# mutations
+p1 <- sample_mutation_matrix %>%
+  ggplot(aes(x = driver_mutations, y = Sample)) +
+  geom_tile(fill = "darkred") +
+  theme_bw() +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  )) +
+  theme(panel.grid = element_blank())
+
+# rearrangements
+p2 <- sample_mutation_matrix %>%
+  ggplot(aes(x = `Common translocation`, y = Sample)) +
+  geom_tile(fill = "darkred") +
+  theme_bw() +
+  theme(axis.text.x = element_text(
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1
+  )) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  ) +
+  ylab("")
+
+ggpubr::ggarrange(
+  p1,
+  p2,
+  ncol = 2,
+  nrow = 1,
+  align = "h",
+  widths = c(4, 1)
+)
+```
+
+<!-- Add driver mutations as metadata to Seurat object. -->
+
+<!-- ```{r} -->
+<!-- sample_aml_subtype_label <- sample_mutation_matrix %>% -->
+<!--   group_by(Sample) %>% -->
+<!--   mutate(aml_subtype = paste0(driver_mutations, collapse = ",")) %>% -->
+<!--   mutate(aml_subtype = gsub(",NA", "", paste(aml_subtype, `Common translocation`, sep = ","))) %>% -->
+<!--   select(Sample, aml_subtype) %>% -->
+<!--   unique() -->
+
+<!-- tmp <- -->
+<!--   merge(rownames_to_column(galen_aml_donors@meta.data), -->
+<!--         sample_aml_subtype_label, -->
+<!--         by = "Sample") -->
+<!-- tmp <- column_to_rownames(tmp, "rowname") -->
+
+<!-- galen_aml_donors@meta.data$DriverMutations <- -->
+<!--   tmp[colnames(galen_aml_donors),]$aml_subtype -->
+<!-- ``` -->
+
+### Cell type composition
+
+Cell types present in data.
+
+```{r}
+unique(galen_aml_donors$CellType)
+```
+
+New metadata column whether cell is a cancer celltype or healthy.
+
+Color scheme to avoid rainbow colors.
+
+```{r}
+cell_types <- unique(galen_aml_donors@meta.data$CellType)
+cell_type_colors <-
+  sample(chameleon::distinct_colors(n = length(cell_types))$name,
+         size = length(cell_types))
+cell_type_colors <- setNames(cell_type_colors, cell_types)
+```
+
+Create more "coarse" cell type labels. 
+Lymphoid and erythroid (non-malignant only), and Myeloid/HSC, Myeloid/HSC-like. 
+
+```{r}
+lymphoid_celltypes <- c("Plasma",
+                        "NK",
+                        "ProB",
+                        "B",
+                        "T",
+                        "CTL",
+                        "pDC")
+```
+
+```{r}
+galen_aml_donors@meta.data <- galen_aml_donors@meta.data %>%
+  mutate(IsCancerCelltype = ifelse(grepl("-like", CellType), T, F)) %>%
+  mutate(CellTypeGeneral = ifelse(
+    CellType %in% lymphoid_celltypes,
+    "Lymphoid",
+    ifelse(
+      IsCancerCelltype,
+      "Myeloid/HSPC-like",
+      ifelse(grepl("Ery", CellType), "Erythroid", "Myeloid/HSPC")
+    )
+  ))
+```
+
+Visualize cell type proportions across samples. 
+
+
+```{r fig.height=4, fig.width=8}
+galen_aml_donors@meta.data %>%
+  group_by(orig.ident) %>%
+  count(CellType) %>%
+  ggplot(aes(fill = CellType, y = n, x = orig.ident)) +
+  geom_bar(position = "fill", stat = "identity") +
+  scale_fill_manual(values = cell_type_colors[unique(galen_aml_donors@meta.data$CellType)]) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+galen_aml_donors@meta.data %>%
+  group_by(orig.ident) %>%
+  count(IsCancerCelltype) %>%
+  ggplot(aes(fill = IsCancerCelltype, y = n, x = orig.ident)) +
+  geom_bar(position = "fill", stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+galen_aml_donors@meta.data %>%
+  group_by(orig.ident) %>%
+  count(PredictionRefined) %>%
+  ggplot(aes(fill = PredictionRefined, y = n, x = orig.ident)) +
+  geom_bar(position = "fill", stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+galen_aml_donors@meta.data %>%
+  group_by(orig.ident) %>%
+  count(CellTypeGeneral) %>%
+  ggplot(aes(fill = CellTypeGeneral, y = n, x = orig.ident)) +
+  geom_bar(position = "fill", stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+
+Myeloid and HSPCs are the cells that are difficult to distinguish between healthy and malignant in AML cells. 
+This is the actual difficult prediction task of the classifier. 
+Visualize the proportion of these cells in the samples. 
+
+```{r fig.height=4, fig.width=8}
+galen_aml_donors@meta.data %>%
+  filter(CellTypeGeneral %in% c("Myeloid/HSPC", "Myeloid/HSPC-like")) %>%
+  group_by(orig.ident, CellTypeGeneral) %>%
+  summarize(n_cells = n()) %>%
+  ggplot(aes(x = orig.ident, y = n_cells, fill = CellTypeGeneral)) +
+  geom_bar(stat = "identity", position = "fill") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+
+Proportion of cycling cells is not higher in AML samples at diagnosis than in healthy samples.
+AML is a disease of differentiation. 
+The accumulation of blasts in the bone marrow is the problem, not hyper proliferation, as in other cancers. 
+
+```{r fig.height=4, fig.width=8}
+galen_aml_donors@meta.data %>%
+  filter(`Days from diagnosis` == "D0" |
+           SampleClass == "HealthyDonor") %>%
+  group_by(orig.ident, SampleClass) %>%
+  count(CyclingBinary) %>%
+  ggplot(aes(fill = CyclingBinary, y = n, x = orig.ident)) +
+  geom_bar(position = "fill", stat = "identity") +
+  facet_grid( ~ SampleClass, scales = "free_x", space = "free") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+```
+
+
+### Genotype information
+
+Classify cells based on their genotype information into malignant and healthy cells. 
+
+I classify all cells with a mutant transcript detected as malignant cells.  
+All other cells from AML samples with a wt allele detected could be classified as healthy.  
+However, this is imperfect, especially for heterozygous dominant negative mutations.  
+Furthermore, due to clonality, there might be cells with wt allele detected and mut allele missed.  
+Both can lead to false positive healthy cells. 
+
+Therefore, only using cells from AML donors genotyped as mutant and healthy cells from healthy donors in the classifier (as done by van Galen).
+
+"The second classifier is used for determining if a cell for which we did not detect a mutant transcript is malignant or normal, based on its similarity to normal and malignant cells (i.e., cells from healthy BM and HSC to myeloid-like cells from tumor samples for which we detected mutant transcripts)."
+
+```{r}
+galen_aml_donors@meta.data <- galen_aml_donors@meta.data %>%
+  mutate(genotype = ifelse(
+    !is.na(MutTranscripts) &
+      MutTranscripts != "",
+    "malignant",
+    ifelse(
+      !is.na(WtTranscripts) &
+        WtTranscripts != "",
+      "healthy",
+      "not_detected"
+    )
+  ))
+```
+
+Plot 1: Cells with mut detected, only wt detected or no coverage, compared to expected blast count.
+
+Plot 2: Cells usable to trian malignant vs. healthy classifier. 
+
+There are multiple samples and patients with no or almost no malignant genotyped cells that can be used for training.  
+Therefore, the classifier needs to be generalizable to other samples and mutations.  
+Overfitting to specific patients would be bad.
+
+```{r}
+p1 <- galen_aml_donors@meta.data %>%
+  group_by(orig.ident, genotype) %>%
+  summarise(n_cells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(fill = genotype, y = n_cells, x = orig.ident)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        panel.grid = element_blank()) +
+  scale_x_discrete(drop = FALSE) +
+  xlab(element_blank())
+
+p2 <- galen_aml_donors@meta.data %>%
+  select(`Blast count`, orig.ident) %>%
+  unique() %>%
+  ggplot(aes(y = `Blast count`, x = orig.ident)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) +
+  scale_x_discrete(drop = FALSE) +
+  xlab(element_blank())
+
+ggpubr::ggarrange(
+  p1,
+  p2,
+  align = "v",
+  heights = c(2, 1),
+  ncol = 1,
+  nrow = 2
+)
+
+p1 <- galen_aml_donors@meta.data %>%
+  mutate(Sample = as.factor(Sample)) %>%
+  filter(genotype == "malignant" |
+           SampleClass == "HealthyDonor") %>%
+  group_by(Sample, genotype) %>%
+  summarise(n_cells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(fill = genotype, y = n_cells, x = Sample)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_x_discrete(drop = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) + scale_x_discrete(drop = FALSE)
+
+p2 <- galen_aml_donors@meta.data %>%
+  filter(genotype == "malignant" |
+           SampleClass == "HealthyDonor") %>%
+  group_by(orig.ident, genotype) %>%
+  summarise(n_cells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(fill = genotype, y = n_cells, x = orig.ident)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  scale_x_discrete(drop = FALSE) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank()) + scale_x_discrete(drop = FALSE)
+
+ggpubr::ggarrange(
+  p1,
+  p2,
+  align = "v",
+  heights = c(1, 1),
+  ncol = 1,
+  nrow = 2
+)
+```
+
+Concordance of genotype and van Galen celltype annotation in AML samples. 
+NB: Cells with only wt transcript detected ("healthy") in AML samples might not be actually healthy (heterozygosity, clonality). 
+
+```{r}
+galen_aml_donors_metadata <- galen_aml_donors@meta.data
+table(
+    filter(galen_aml_donors_metadata, SampleClass != "HealthyDonor")$genotype,
+    filter(galen_aml_donors_metadata, SampleClass != "HealthyDonor")$CellType
+  )
+```
+
+
+<!-- Heatmap of number of cells from AML donors -->
+
+<!-- ```{r} -->
+<!-- galen_aml_donors_metadata <- galen_aml_donors@meta.data -->
+<!-- heatmap( -->
+<!--   table( -->
+<!--     filter(galen_aml_donors_metadata, SampleClass != "HealthyDonor")$genotype, -->
+<!--     filter(galen_aml_donors_metadata, SampleClass != "HealthyDonor")$CellType -->
+<!--   ), -->
+<!--   scale = NULL, -->
+<!--   Colv = NA, -->
+<!--   Rowv = NA -->
+<!-- ) -->
+<!-- ``` -->
+
+
+
+Sex bias in cells that can be used to train classifier (mut transcript detected from AML donor, or from healthy donor). 
+
+```{r fig.height=3, fig.width=6}
+p1 <- galen_aml_donors@meta.data %>%
+  filter(genotype == "malignant" |
+           SampleClass == "HealthyDonor") %>%
+  mutate(class = ifelse(genotype == "malignant", "malignant", "healthy")) %>%
+  group_by(Gender, class) %>%
+  summarise(n_cells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = class, y = n_cells, fill = Gender)) +
+  geom_bar(position = "fill", stat = "identity") +
+  # geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p2 <- galen_aml_donors@meta.data %>%
+  filter(genotype == "malignant" |
+           SampleClass == "HealthyDonor") %>%
+  mutate(class = ifelse(genotype == "malignant", "malignant", "healthy")) %>%
+  group_by(Gender, class) %>%
+  summarise(n_cells = n()) %>%
+  ungroup() %>%
+  ggplot(aes(x = Gender, y = n_cells, fill = class)) +
+  geom_bar(position = "fill", stat = "identity") +
+  # geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+p1 | p2
+```
+
+
+### Accuracy of the classifier
+
+Check the accuracy of the van Galen classifier based on concordance with clinical blast count. 
+This has already been checked in the paper and the answer is that the correlation is high. 
+
+```{r}
+# samples with unclear prediction
+galen_aml_donors@meta.data %>%
+  filter(PredictionRefined == "unclear") %>%
+  pull(orig.ident) %>%
+  unique() %>% as.character()
+
+pred_malignant_vs_blast_count <- galen_aml_donors@meta.data %>%
+  group_by(
+    orig.ident,
+    PredictionRefined,
+    `Blast count`,
+    `Cell number`,
+    Sample,
+    Gender,
+    # DriverMutations,
+    `Days from diagnosis`
+  ) %>%
+  summarize(PredictionRefinedProportion = n() / `Cell number`) %>%
+  filter(PredictionRefined == "malignant") %>%
+  select(
+    `Blast count`,
+    PredictionRefinedProportion,
+    orig.ident,
+    Sample,
+    Gender,
+    # DriverMutations,
+    `Days from diagnosis`
+  ) %>%
+  unique() %>%
+  mutate(`Blast count` = as.numeric(`Blast count`)) %>%
+  ungroup()
+
+nrow(pred_malignant_vs_blast_count)
+
+pred_malignant_vs_blast_count %>%
+  ggplot(aes(
+    x = PredictionRefinedProportion,
+    y = `Blast count`,
+    group = Sample,
+    color = Sample
+  )) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0) +
+  ggrepel::geom_text_repel(aes(label = orig.ident),
+                           size = 3,
+                           max.overlaps = Inf) +
+  theme_bw() +
+  coord_equal() +
+  theme(panel.grid = element_blank())
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+cor.test(
+  pred_malignant_vs_blast_count$PredictionRefinedProportion,
+  pred_malignant_vs_blast_count$`Blast count`
+)
+```
+
+If the sex bias in healthy and AML samples matters, then the difference between predicted and observed blast count (error) should be larger in females than males. 
+
+Predicted proportion of malignant cells agrees less with clinical blast count for female samples.
+Markedly, female samples have an overestimated proportion of malignant cell. 
+
+However, this could also be due to other factors covarying with Sex, like mutated gene or blast count.
+
+Median absolute error 10.8%(F), 3.1%(M).
+
+```{r fig.height=3, fig.width=4}
+pred_malignant_vs_blast_count_error <- pred_malignant_vs_blast_count %>%
+  mutate(error = PredictionRefinedProportion - `Blast count`,
+         absolute_error = abs(error),
+         relative_error = PredictionRefinedProportion / `Blast count`) %>%
+  pivot_longer(
+    cols = c(error, absolute_error, relative_error),
+    names_to = "error_type",
+    values_to = "error"
+  ) %>%
+  group_by(error_type, Gender) 
+
+pred_malignant_vs_blast_count_error %>%
+  summarize(median_error = round(median(error), 3))
+```
+
+
+```{r fig.height=3, fig.width=4}
+symmetric_limits <- function (x)
+{
+  max <- max(abs(x))
+  c(-max, max)
+}
+
+p1 <- pred_malignant_vs_blast_count_error %>%
+  filter(error_type %in% c("error", "absolute_error")) %>%
+  ggplot(aes(x = error_type, y = error * 100, fill = Gender)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_boxplot(outlier.size = 0) +
+  geom_point(pch = 21, position = position_jitterdodge(jitter.width = 0.1)) +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_bw() +
+  theme(panel.grid = element_blank(), legend.position = "None") +
+  ylab("Prediction error % blasts") +
+  scale_y_continuous(limits = symmetric_limits) +
+  xlab(element_blank()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p2 <- pred_malignant_vs_blast_count_error %>%
+  filter(error_type %in% c("relative_error")) %>%
+  ggplot(aes(x = error_type, y = log2(error), fill = Gender)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_boxplot(outlier.size = 0) +
+  geom_point(pch = 21, position = position_jitterdodge(jitter.width = 0.1)) +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  ylab("log2 relative error % blasts") +
+  scale_y_continuous(limits = symmetric_limits) +
+  xlab(element_blank()) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggpubr::ggarrange(p1, p2, align = "h", widths = c(1, 1.2))
+```
+
+
+<!-- Residuals of linear model.  -->
+
+<!-- ```{r fig.height=3, fig.width=3.5} -->
+<!-- model <- lm(PredictionRefinedProportion ~ `Blast count`, data=pred_malignant_vs_blast_count)  -->
+
+<!-- tmp <- pred_malignant_vs_blast_count %>% -->
+<!--   dplyr::mutate( -->
+<!--     fits = fitted(model), -->
+<!--     resids = resid(model), -->
+<!--     sresids = rstudent(model) -->
+<!--   ) -->
+
+<!-- tmp %>% -->
+<!--   group_by(Gender) %>% -->
+<!--   summarize(sum(abs(resids)), mean(abs(resids)), median(abs(resids))) -->
+
+<!-- #create residual plot -->
+<!-- ggplot(tmp, aes(x = fits, y = resids, color = Gender)) + -->
+<!--   ggrepel::geom_text_repel(aes(label = paste(Sample, , sep = "|")), max.overlaps = Inf) + -->
+<!--   geom_hline(yintercept = 0, linetype = 2) + -->
+<!--   geom_point() + -->
+<!--   theme_bw() -->
+<!-- ``` -->
+
+
+
+### Data quality
+
+According to manuscript, cells were filtered for >1000 UMI, >500 genes and <20% mitochondrial+ribosomal transcripts.
+
+The Rdata object contains filtered cells. 
+
+```{r fig.width=20, fig.height=10}
+VlnPlot(galen_aml_donors, features = c("nCount_RNA", "nFeature_RNA"), ncol = 1, log = T, pt.size = 0)
+```
+
+<!-- ```{r fig.height=4, fig.width=5} -->
+<!-- galen_aml_donors@meta.data %>% -->
+<!--   group_by(orig.ident, `Cell number`, SampleClass) %>% -->
+<!--   dplyr::summarise(median_nFeature_RNA = median(nFeature_RNA)) %>% -->
+<!--   ggplot(aes(x = `Cell number`, y = median_nFeature_RNA)) + -->
+<!--   geom_point(aes(color = SampleClass)) + -->
+<!--   geom_smooth(method = "lm") + -->
+<!--   theme_bw() + -->
+<!--   theme(panel.grid = element_blank()) -->
+<!-- ``` -->
+
+
+### Low dimensional embedding
+
+#### AML and healthy donors
+
+Normalize data by library size and log transform.  
+Identify 2000 highly variable genes.  
+Scale/z-score highly variable genes.  
+
+```{r results=F}
+galen_aml_donors <- NormalizeData(galen_aml_donors, scale.factor = 10000)
+galen_aml_donors <- FindVariableFeatures(galen_aml_donors)
+galen_aml_donors <- ScaleData(galen_aml_donors)
+```
+
+Calculate PCA and check elbow plot for appropriate number of PCs for UMAP embedding. 
+
+```{r results=F}
+galen_aml_donors <- RunPCA(galen_aml_donors)
+```
+
+
+```{r}
+ElbowPlot(galen_aml_donors, ndims = 50) +
+  coord_cartesian(ylim = c(0, NA))
+```
+
+Calculate UMAP embedding. 
+
+```{r results=F}
+galen_aml_donors <- RunUMAP(galen_aml_donors, dims = 1:15)
+```
+
+Check UMAP for technical and biological variation.
+
+Higher read counts in erythrocyte progenitors.
+
+
+```{r fig.height=6, fig.width=7}
+# technical
+FeaturePlot(galen_aml_donors, features = "nCount_RNA", pt.size = 0.005, max.cutoff = "q99") + coord_equal()
+FeaturePlot(galen_aml_donors, features = "nFeature_RNA", pt.size = 0.005) + coord_equal()
+```
+
+
+```{r fig.height=6, fig.width=7}
+# annotation biological
+DimPlot(galen_aml_donors, group.by = "SampleClass", shuffle = T, pt.size = 0.005) + coord_equal()
+DimPlot(galen_aml_donors, group.by = "IsCancerCelltype", shuffle = T, pt.size = 0.005) + coord_equal()
+DimPlot(galen_aml_donors, group.by = "PredictionRefined", shuffle = T, pt.size = 0.005) + coord_equal()
+DimPlot(galen_aml_donors, group.by = "CellType", shuffle = T, pt.size = 0.005, label = T, label.size = 3) + coord_equal()
+DimPlot(galen_aml_donors, group.by = "orig.ident", shuffle = T, pt.size = 0.005, label = T, label.size = 2) + coord_equal() + NoLegend()
+FeaturePlot(galen_aml_donors, features = "Age", pt.size = 0.005) + coord_equal()
+DimPlot(subset(galen_aml_donors, SampleClass == "HealthyDonor"), group.by = "orig.ident", shuffle = T, pt.size = 0.005) + coord_equal()
+```
+
+
+```{r fig.height=6, fig.width=7}
+# sex differences
+DimPlot(galen_aml_donors, group.by = "Gender", shuffle = T, pt.size = 0.005) + coord_equal()
+DimPlot(subset(galen_aml_donors, SampleClass == "AmlDonor"), group.by = "Gender", shuffle = T, pt.size = 0.005) + coord_equal()
+DimPlot(subset(galen_aml_donors, SampleClass == "AmlDonor"), group.by = "Sample", shuffle = T, pt.size = 0.005, split.by = "Gender") + coord_equal()
+DimPlot(galen_aml_donors, group.by = "Sample", shuffle = T, pt.size = 0.005, split.by = "Gender") + coord_equal()
+```
+
+#### Embedding healthy donors
+
+Create an embedding of just the healthy samples to visualize the normal hematopoietic trajectory.  
+Same procedure as above. 
+
+```{r}
+galen_aml_donors_healthy <- subset(galen_aml_donors, SampleClass == "HealthyDonor")
+```
+
+```{r results=F}
+galen_aml_donors_healthy <- FindVariableFeatures(galen_aml_donors_healthy)
+galen_aml_donors_healthy <- ScaleData(galen_aml_donors_healthy)
+```
+
+```{r results=F}
+galen_aml_donors_healthy <- RunPCA(galen_aml_donors_healthy)
+```
+
+```{r}
+ElbowPlot(galen_aml_donors_healthy, ndims = 50) +
+  coord_cartesian(ylim = c(0, NA))
+```
+
+```{r results=F}
+galen_aml_donors_healthy <- RunUMAP(galen_aml_donors_healthy, dims = 1:15)
+```
+
+
+```{r fig.height=5, fig.width=7}
+DimPlot(galen_aml_donors_healthy, group.by = "CellType", shuffle = T, pt.size = 0.01, label = T, label.size = 3) +
+  coord_equal()
+DimPlot(galen_aml_donors_healthy, group.by = "orig.ident", shuffle = T, pt.size = 0.01, label = T, label.size = 3) +
+  coord_equal() + NoLegend()
+```
+
+
+<!-- Check how reliable UMAP is, i.e. how well it captures the PC space, using the default UMAP parameters. -->
+
+<!-- ```{r} -->
+<!-- library(scDEED) -->
+<!-- K = 8 -->
+<!-- result = scDEED(galen_aml_donors_healthy, K = K, reduction.method = 'umap', n_neighbors = 30, min.dist = 0.3, rerun = F) -->
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- dubious_cells = result$full_results$dubious_cells[result$full_results$n_neighbors == '30'] -->
+<!-- dubious_cells = as.numeric(strsplit(dubious_cells, ',')[[1]]) -->
+<!-- trustworthy_cells =  result$full_results$trustworthy_cells[result$full_results$n_neighbors == '30'] -->
+<!-- trustworthy_cells = as.numeric(strsplit(trustworthy_cells, ',')[[1]]) -->
+
+<!-- DimPlot( -->
+<!--   galen_aml_donors_healthy, -->
+<!--   reduction = 'umap', -->
+<!--   cells.highlight = list('dubious' = dubious_cells, 'trustworthy' = trustworthy_cells) -->
+<!-- ) + scale_color_manual(values = c('gray', 'blue', 'red')) + coord_equal() -->
+<!-- ``` -->
+
+#### AML and healthy donors excluding sex-specific genes
+
+SDE scores for all protein-coding genes in 45 tissues common to men and women. 
+Genes were analyzed by NOISeqBIO with scores of zero given for genes with insignificant differential expression. 
+Other genes have SDE scores below zero for men-biased expression and above zero for women-biased expression. (CSV 2205 kb)
+
+Bone marrow is not available. Instead use whole blood and spleen.
+
+```{r}
+sex_genes <- read_csv("gershoni_et_al/12915_2017_352_MOESM3_ESM.csv")
+sex_genes <- sex_genes %>% 
+  select(Gene, Spleen, Whole_Blood) %>%
+  filter(Spleen != 0 | Whole_Blood != 0) %>%
+  mutate(gene = gsub("_.*", "", Gene)) %>%
+  pull(gene)
+
+sex_genes <- c(sex_genes, "XIST")
+
+# make sure IDs match
+sex_genes[!sex_genes %in% rownames(galen_aml_donors)]
+
+length(sex_genes)
+```
+
+Also exclude genes expressed on Y chromosome.
+149 genes present in scRNA-seq data.
+
+```{r}
+y_chrom_genes <- read_lines("reference_sources/gencode.v44_gene_names_chrY.txt")
+y_chrom_genes <- y_chrom_genes[y_chrom_genes %in% rownames(galen_aml_donors)]
+length(y_chrom_genes)
+
+sex_genes <- unique(c(sex_genes, y_chrom_genes))
+```
+
+6 out of 2000 highly variable genes (AML+healthy) have sex-specific expression.
+
+I don't think removal of all genes that are differentially expressed betwen M and F should be remove, because there variables that co-vary with sex. 
+
+```{r}
+# sex-specific genes used for embedding
+sex_genes[sex_genes %in% VariableFeatures(galen_aml_donors)]
+```
+
+Re-calculate PCA, excluding sex-specific genes from HVG list.
+
+```{r results=F}
+galen_aml_donors <-
+  RunPCA(
+    galen_aml_donors,
+    features = VariableFeatures(galen_aml_donors)[!VariableFeatures(galen_aml_donors) %in% sex_genes],
+    reduction.name = "pca_no_sex"
+  )
+```
+
+
+```{r}
+ElbowPlot(galen_aml_donors, ndims = 50, reduction = "pca_no_sex") +
+  coord_cartesian(ylim = c(0, NA))
+```
+
+```{r results=F}
+galen_aml_donors <-
+  RunUMAP(
+    galen_aml_donors,
+    dims = 1:15,
+    reduction = "pca_no_sex",
+    reduction.name = "umap_no_sex"
+  )
+```
+
+I would check if the integration of sexes has improved if CalcAlignmentMetric was still available in Seurat v5...
+
+MixingMetric has replaced CalcAlignmentMetric (Seurat v2).
+
+
+Explanation of [MixingMetric](https://github.com/satijalab/Integration2019/issues/1)
+
+> 1. Look at the k.max nearest neighbors for a cell across all datasets.
+  2. Compute the k closest neighbors for each dataset individually for the same cell.
+  3. Find the rank in the overall neighborhood list (from 1.) that corresponds to the kth neighbor in each dataset (max of k.max) and take the median across all datasets.
+  4. Compute 1-3 for every cell and average.
+  This average is the value that is returned by the MixingMetric function. However, it's usually more intuitive to think of high values of "mixing" to be better so for visualization, we often plot max.k - MixingMetric.
+
+Deafult `max.k = 300`.
+
+According to this metric, mixing of cells from male and female AML donors has *slightly* improved. 
+
+```{r results = F}
+mixing_aml_sexes <- MixingMetric(
+  subset(galen_aml_donors, SampleClass == "AmlDonor"),
+  reduction = "pca",
+  dims = 1:15,
+  grouping.var = "Gender"
+)
+
+mixing_aml_sexes_corrected <- MixingMetric(
+  subset(galen_aml_donors, SampleClass == "AmlDonor"),
+  reduction = "pca_no_sex",
+  dims = 1:15,
+  grouping.var = "Gender"
+)
+```
+
+
+```{r}
+300 - mean(mixing_aml_sexes)
+300 - mean(mixing_aml_sexes_corrected)
+```
+
+
+
+```{r fig.height=6, fig.width=7}
+# sex differences
+DimPlot(
+  subset(galen_aml_donors, SampleClass == "AmlDonor"),
+  reduction = "umap_no_sex",
+  group.by = "Gender",
+  shuffle = T,
+  pt.size = 0.005
+) + coord_equal()
+```
+
+## Task 2: ML classifier malignant cells
+
+**Task Description**
+
+An interesting feature of the dataset is the availability of labels distinguishing malignant and non-malignant single cells. 
+The second task is to exploit these labels to build a suitable ML classifier that predicts the normal or malignant identity of single cells. 
+Please detail on how your classifier works, whether it is interpretable, its performance, and the train-test split you use for your machine learning experiment.  
+
+### Considerations for the task
+
+The tricky part is not training a classifier, but to consider biology and technology to train a *good* classifier. 
+
+I assume that "labels distinguishing malignant and non-malignant single cells" in the task description refers to the genotyped cells, and not the labels predicted by van Galen et al. based on their random forest classifiers.  
+
+Van Galen et al. train two random forest classifiers (see below), in order to classify cells from AML donors into malignant and normal cells.  
+The first classifier is for HSPC cell types and the second for HSPC cell types + malignant vs. normal. 
+Each classifier consists of an "outer" classifier for feature selection and an "inner" classifier that is used for prediction. 
+Due to very limited number of genotyped cells that can be used for training, they do not hold out a test set. 
+Instead, to evaluate their model performance, they perform 5-fold cross validation of the "inner" classifier.  
+Finally, they use the model trained on all available data for classification of AML cells that were not genotyped.  
+
+I assume that at the time there was no independent dataset available with genotyped AML cells to test for generalizability of the model to other scRNA-seq technologies (droplet-based, 5' sequencing), human populations, or driver mutations. 
+
+**Points of critique**
+
+1. Including all training data in the feature selection makes the CV results of the "inner" classifier less informative.
+2. The CV is supposed to evaluate over- and underfitting.
+    To estimate overfitting (complexity of the model), the model should be evaluated on how well it extrapolates to another donor and to another driver mutation, not a random sample of all training cells.
+3. All healthy cells in the training data are male. Van Galen do not address this by removing sex-specific genes from the features. 
+    (I'm honestly suprised that the classifier doesn't perform even worse on female samples based on blast count than it does. 
+    A male sample with loss of y might play a role, and expression level/sparsity of sex-specific genes.)
+4. Cells were genotyped based on transcripts of following genes:  
+    TET2, SETD2, PTPN11, NRAS, SF3A1, BCOR, KIT, RAD21, TP53, BRCC3, RUNX1, FLT3, IDH2, DNMT3A, SMC3, NPM1, KRAS.  
+    Cells with higher expression of these genes are more likely to be genotyped and make it into the training data.
+    Their expression should be excluded from the feature list, also to make it more generalisable to other driver mutations. 
+5. The classifier does not consider possible differences in transcription between non-malignant HSPCs from AML donors and healthy donors. 
+    Non-malignant cells from AML donors have possibly altered transcription due to changes in the environment in the bone marrow.  
+    The classifier only considers healthy cells from healthy donors, and not non-malignant cells from AML donors. 
+    This is a limitation of the technology, because cells with wt transcript detected but no mutated transcript detected cannot confidently be classified as normal, due to clonality and heterozygosity.  
+    However, there might be a subset of cells from donors with known zygosity and clonal structure where this is possible. 
+
+What I agree with, is the observation that, generally, malignant HSCs are transcriptionally more similar to healthy HSCs than to malignant monocyte progenitors.
+Therefore, it makes sense to guide the model with information on similarity towards healthy HSPC cell types.  
+
+Random forest classifiers allow the extraction of feature importance metrics (e.g. number of trees in which a feature is used).
+However, one has to differ between a *minimal optimal subset* and an *all relevant subset* of genes. 
+This is especially relevant for gene-expression based classifiers due to redundance (think gene modules/signatures).
+See [Kursa et al. 2014](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-15-8) for more details. 
+
+Van Galen et al. select as features the genes chosen most often in the outer classifier, across 1000 trees. This does not seem to consider classes. 
+
+**Ideas**
+
+- Instead of predicting HSC and HSC-like cells, why not give a similarity score towards each healthy cell type as input feature. 
+    This would allow to inform the classifier for relevant features like combinations of signatures (e.g. LSCs arising from GMPs with mixed HSC/GMP signature).
+- Why include lymphoid and erythroid cell types in the malignant vs. non-malignant classifier? 
+    They are transcriptionally very distinct and in AML they are not malignant. 
+    The classifier might have an easier time if they are excluded. 
+- Consider other methods to assign the most similar healthy cell type, such as label transfer via projection onto the healthy reference (Azimuth). 
+- Use an independent test set of genotypes AML cells. 
+
+**Van Galen classifier malignant vs. normal AML cells**
+
+```{r echo = F, out.width="100%", fig.width=15}
+nomnoml::nomnoml(code = "#direction: down
+[<frame>HSPC celltype annotation |
+[Healthy cells] - 
+[<state> Backspin clustering | Manual HSPC cell type annotation] - 
+[Healthy cells, annotated by HSPC cell types] - [<state> Train RF] - 
+[Classifier for HSPC cell types] - [<state> Predict]
+[AML cells] - [<state> Predict] -
+[AML cells, annotated by HSPC cell types]
+]
+
+[<frame>Malignant celltype annotation |
+[AML cells, genotyped malignant | HSPC-like cell type labels] - [<state> Train RF]
+[Healthy cells | HSPC cell type labels] - [<state> Train RF] -
+[Classifier for HSPC & HSPC-like cell types] - [<state> Predict]
+[AML cells, not genotyped malignant | HSPC-like cell type labels] - [<state> Predict] -
+[AML cells, annotated by HSPC & HSPC-like cell types]
+]")
+```
+
+
+
+```{r}
+unique(gsub("\\..*", "", unique(galen_aml_donors$MutTranscripts)))
+genes_genotypes <-
+  c(
+    "NRAS",
+    "KRAS",
+    "SF3A1",
+    "NPM1",
+    "DNMT3A",
+    "FLT3",
+    "TP53",
+    "SETD2",
+    "RUNX1",
+    "BCOR",
+    "PTPN11",
+    "SMC3",
+    "IDH2",
+    "TET2",
+    "BRCC3",
+    "KIT",
+    "RAD21"
+  )
+```
+
+### Transcriptional heterogeneity of malignant and healthy cells
+
+The goal is to develop a classifier of malignant vs. healthy HSPCs and myeloid cells from AML patients, that is generalizable to other AML types with other driver mutations and other scRNA-seq technologies/datasets. 
+
+Evaluate the transcriptional heterogeneity of AML subtypes and malignant vs. healthy cells.
+
+Q1: Do healthy cells differ from malignant cells based on their transcriptome?
+
+Q2: Is the malignant transcriptional profile specific to driver mutations?
+
+We are only interested in myeloid and HSPC cells here, because distinction of erythroid and lymphoid cells is relatively easy. 
+Those cells are not malignant in acute *myeloid* leukemia. 
+
+For a start, use HSPCs + myeloid cells, according to van Galen cell type annotation.  
+
+<!-- Only consider samples with blast count > 0.1 and at time of diagnosis.  -->
+<!-- These were 2 variables that accounted for most of the variance in the data.  -->
+
+Include healthy donors, to see if the cells genotyped as wt group with definitive healthy cells. 
+
+```{r}
+selected_samples <- donor_metadata %>%
+  # filter(
+  #   !grepl("BM", Sample),
+  #   # `Blast count` > 0.1,
+  #   # `Days from diagnosis` == "D0"
+  #   ) %>%
+  pull(SampleId)
+
+galen_aml_donors_myeloid_hspc <-
+  subset(
+    galen_aml_donors,
+    subset = (orig.ident %in% selected_samples & SampleClass == "HealthyDonor" | 
+      ((CellTypeGeneral == "Myeloid/HSPC-like" |
+      CellTypeGeneral == "Myeloid/HSPC") & genotype != "not_detected"))
+  )
+table(galen_aml_donors_myeloid_hspc$genotype)
+
+# only keep SampleId-genotype combinations with at least 10 cells
+samples_enough_cells <- names(which(table(galen_aml_donors_myeloid_hspc$orig.ident) >= 10))
+galen_aml_donors_myeloid_hspc <-
+  subset(
+    galen_aml_donors_myeloid_hspc,
+    subset = orig.ident %in% samples_enough_cells
+  )
+```
+
+```{r}
+galen_aml_donors_myeloid_hspc@meta.data <- galen_aml_donors_myeloid_hspc@meta.data %>%
+  mutate(
+    SampleId_genotype =
+      paste(
+        galen_aml_donors_myeloid_hspc$orig.ident,
+        galen_aml_donors_myeloid_hspc$genotype,
+        sep = "_"
+      )
+  ) %>%
+  mutate(SampleId_genotype = ifelse(SampleClass == "HealthyDonor", gsub("not_detected", "healthy", SampleId_genotype), SampleId_genotype))
+```
+
+
+```{r}
+pb_counts <-
+  Seurat::AggregateExpression(
+    galen_aml_donors_myeloid_hspc,
+    assays = "RNA",
+    slot = "counts",
+    # group.by = "SampleId_CellTypeGeneral"
+    group.by = "SampleId_genotype"
+    # group.by = "orig.ident"
+  )$RNA
+
+group_anno <- colnames(pb_counts)
+group_anno <- gsub(".*-", "", group_anno)
+ 
+pb_dge <- edgeR::DGEList(
+    counts = pb_counts,
+    samples = colnames(pb_counts),
+    group = group_anno
+)
+```
+
+Filter out samples with low read count (=few filtered cells).  
+Keep samples with read counts > 50,000, which is all samples.
+
+```{r}
+summary(pb_dge$samples$lib.size)
+
+keep.samples <- pb_dge$samples$lib.size > 5e4
+table(keep.samples)
+
+# pb_dge <- pb_dge[, keep.samples]
+```
+
+Filter out lowly expressed genes.  
+Keep genes with at least 10 CPM in at least 2 samples.
+ 
+```{r}
+# genes with at least 1 CPM in at least 2 samples
+keep.genes <- rowSums(edgeR::cpm(pb_dge) >=10) >= 2
+table(keep.genes)
+ 
+pb_dge <- pb_dge[keep.genes, , keep=FALSE]
+```
+
+TMM normalization is performed to estimate effective library size.
+ 
+```{r}
+pb_dge <- edgeR::calcNormFactors(pb_dge, method = "TMM")
+```
+ 
+Calculate Multidimensional scaling (MDS) plot of distances between gene expression profiles.
+ 
+```{r}
+pb_mds <- limma::plotMDS(pb_dge, plot = F)
+
+pb_mds_df <- data.frame(
+  list(
+    x = pb_mds$x,
+    y = pb_mds$y,
+    lib.size = pb_dge$samples$lib.size,
+    sample = gsub("-.*", "", colnames(pb_dge)),
+    group = pb_dge$samples$group
+  )
+) %>%
+  merge(donor_metadata, by.x = "sample", by.y = "SampleId", all.x = T)
+```
+
+Check that major source of variation is not technical (sample size) or irrelevant biological information in this case (blast count).
+
+```{r fig.height=3.5, fig.width=5}
+xlab_text <- paste0(
+    "Leading logFC dim 1 (",
+    round(pb_mds$var.explained[1] * 100, 1),
+    "%)"
+  )
+ylab_text <- paste0(
+    "Leading logFC dim 2 (",
+    round(pb_mds$var.explained[2] * 100, 1),
+    "%)"
+  )
+
+mds_theme <- theme_bw() +
+  theme(panel.grid = element_blank())
+
+pb_mds_df %>%
+  unique() %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = log(lib.size))) +
+  # ggrepel::geom_text_repel() +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme
+
+pb_mds_df %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = `Blast count`)) +
+  # ggrepel::geom_text_repel() +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme
+
+pb_mds_df %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = `Days from diagnosis` == "D0")) +
+  # ggrepel::geom_text_repel() +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme
+
+pb_mds_df %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = group)) +
+  # ggrepel::geom_text_repel() +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme
+
+pb_mds_df %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = Gender)) +
+  # ggrepel::geom_text_repel() +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme
+
+pb_mds_df %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = Sample)) +
+  ggrepel::geom_text_repel(
+    size = 2,
+    min.segment.length = 0,
+    max.overlaps = Inf
+  ) +
+  xlab(xlab_text) + ylab(ylab_text) +
+  mds_theme +
+  theme(legend.position = "None")
+```
+
+
+Check if the samples split by mutation.
+
+```{r}
+sampleId_mutation_list <- donor_metadata %>%
+  select(SampleId, `RHP Mutations`, `Common translocation`) %>%
+  filter(SampleId %in% pb_mds_df$sample) %>%
+  pivot_longer(cols = c(`RHP Mutations`, `Common translocation`), values_to = "driver_mutation") %>%
+  select(-name) %>%
+  filter(!driver_mutation %in% c("Not performed", "None Detected", "Unknown", "NA") & !is.na(driver_mutation)) %>%
+  separate_longer_delim(cols = driver_mutation, "/// ") %>%
+  mutate(driver_mutation = gsub(" .*", "", driver_mutation)) %>%
+  # unique for samples with multiple mutations in same gene
+  unique() %>%
+  mutate(value = T) %>%
+  pivot_wider(id_cols = SampleId, names_from = driver_mutation, values_fill = F) %>%
+  pivot_longer(cols = -SampleId, names_to = "driver_mutation")
+```
+
+
+```{r}
+pb_mds_df_driver_mutation <- merge(pb_mds_df, sampleId_mutation_list, by.x = "sample", by.y = "SampleId", all.x = T)
+```
+
+PC1 aligns with DNMTA3. Indication that DNMT3 has a distinct transcriptional profile. 
+
+"DNMT3A mutations occur in approximately 20% of AML cases and are associated with changes in DNA methylation. CDKN2B plays an important role in the regulation of hematopoietic progenitor cells and DNMT3A mutation is associated with CDKN2B promoter methylation."
+https://pmc.ncbi.nlm.nih.gov/articles/PMC7106122/
+
+KRAS, FLT3-ITD, NPM1, NRAS
+
+```{r, fig.height=8}
+pb_mds_df_driver_mutation %>%
+  filter(group == "malignant") %>%
+  ggplot(aes(x, y, label = sample)) +
+  geom_point(aes(color = value)) +
+  facet_wrap(~driver_mutation) +
+  xlab(xlab_text) + ylab(ylab_text) +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  coord_equal()
+```
+
+### Azimuth projection
+
+Alternative to cell type identification with a random forest model is label transfer from a reference atlas. 
+
+Perform label transfer from the Azimuth bone marrow reference atlas. 
+Instead of training a random forest classifier to determine the most similar healthy equivalent of a cell.  
+
+Azimuth provides cell type labels at 2 levels, see [interactive reference](https://azimuth.hubmapconsortium.org/references/human_bonemarrow/).
+
+For this step, we are not interested in the genes distinguishing the different cell types because they are already well defined. 
+So we don't need a RF classifier where we can extract feature importance metrics. 
+
+The label transfer is very fast and easy and provides a well established reference framework of cell type classifications and hierarchies. 
+
+Reference downloaded from [here](http://seurat.nygenome.org/src/contrib/bonemarrowref.SeuratData_1.0.0.tar.gz).
+
+```{r}
+library(Azimuth)
+library(SeuratData)
+```
+
+```{r results=F, eval=F}
+# The RunAzimuth function can take a Seurat object as input
+# overwrites miscellanous data, so saving as new object
+galen_aml_donors_azimuth <- RunAzimuth(galen_aml_donors,
+                                       reference = "azimuth_reference/bonemarrowref.SeuratData/inst/azimuth/")
+```
+
+Add Azimuth labels to original seurat object.
+
+```{r, eval=F}
+galen_aml_donors <-
+  AddMetaData(
+    galen_aml_donors,
+    galen_aml_donors_azimuth@meta.data,
+    col.name = c("predicted.celltype.l1", "predicted.celltype.l2")
+  )
+```
+
+
+The function returns cell type labels on 2 levels, and 2 QC metrics, a mapping score and a prediction score for each level.  
+It also returns the projection of the cells onto the reference UMAP space.
+
+```{r fig.height=7, eval=F}
+DimPlot(galen_aml_donors_azimuth, group.by = "predicted.celltype.l1", shuffle = T, label = T) + coord_equal()
+FeaturePlot(galen_aml_donors_azimuth, features = "predicted.celltype.l1.score") + coord_equal()
+DimPlot(galen_aml_donors_azimuth, group.by = "predicted.celltype.l2", shuffle = T, label = T) + coord_equal()
+FeaturePlot(galen_aml_donors_azimuth, features = "predicted.celltype.l2.score") + coord_equal()
+FeaturePlot(galen_aml_donors_azimuth, features = "mapping.score") + coord_equal()
+
+DimPlot(galen_aml_donors_azimuth, group.by = "SampleClass", shuffle = T) + coord_equal()
+DimPlot(galen_aml_donors_azimuth, group.by = "CellType", shuffle = T, label = T) + coord_equal()
+```
+
+
+Compare Azimuth annotations with backspin cluster annotation, followed by RF.
+Also compare with malignant/non malignant RF annotation. 
+
+```{r fig.height=5, eval=F}
+heatmap(table(galen_aml_donors$backspin_celltype, galen_aml_donors$predicted.celltype.l1), scale = NULL, Rowv = NA, Colv = NA)
+heatmap(table(galen_aml_donors$backspin_celltype, galen_aml_donors$predicted.celltype.l2), scale = NULL, Rowv = NA, Colv = NA)
+
+heatmap(table(galen_aml_donors$CellType, galen_aml_donors$predicted.celltype.l1), scale = NULL, Rowv = NA, Colv = NA)
+heatmap(table(galen_aml_donors$CellType, galen_aml_donors$predicted.celltype.l2), scale = NULL, Rowv = NA, Colv = NA)
+```
+
+In the end, I realized that the Azimuth annotations are problematic, becaue either very granular or useless because lumping everything into HSPC. 
+
+
+### Train classifier
+
+backspin celltype annotation is available for 783 cells of 1,590 BM5 CD34+CD38–.
+
+```{r}
+y <- factor(galen_aml_donors_healthy$backspin_celltype)
+X <- galen_aml_donors_healthy@assays$RNA@layers$data
+X <- X[,!is.na(y)]
+rownames(X) <- rownames(galen_aml_donors_healthy)
+y <- y[!is.na(y)]
+
+# # combine HSC and Prog
+# y[y %in% c("HSC", "Prog")] <- "HSC_Prog_"
+```
+
+Van Galen et al. select genes with average normalized expression >= 0.01 (normalized to 10k reads).
+This is biased by class. Instead, select genes expressed in 5% cells in at least 1 class (10141 genes).
+
+```{r}
+# mean normalized expression >= 0.01
+keep.genes <- rowMeans(exp(X) - 1) >= 0.01
+table(keep.genes)
+
+# expressed in 1% cells
+keep.genes.expressed <- rowSums((X > 0) / ncol(galen_aml_donors_healthy)) >= 0.01
+table(keep.genes.expressed)
+
+# expressed in 1% cells in at least 1 class
+classes <- unique(y)
+keep.genes.class <- lapply(classes, FUN = function(class) {
+  genes <- names(which(rowSums((X[,y == class] > 0) / sum(y == class)) >= 0.05))
+  return(genes)
+})
+keep.genes.class <- rownames(X) %in% unlist(keep.genes.class)
+table(keep.genes.class)
+
+X <- X[which(keep.genes.class),]
+```
+
+
+All cells are male. Remove sex-specific genes anyways. 
+
+```{r}
+keep.genes <- !rownames(X) %in% sex_genes
+table(keep.genes)
+X <- X[which(keep.genes),]
+```
+
+
+sampsize is the number of cells sampled from each class. By default `ceiling(.632*nrow(x))`.
+This is one way to deal with imbalanced data in RF by using balanced data sets for each tree, even if the data is not balanced, which is made possible by bootstrap.
+
+Train 100 trees because I'm impatient. 
+
+```{r}
+set.seed(123)
+rf.celltype.outer <- randomForest(
+  x = t(X),
+  y = y,
+  sampsize = rep(50, length(unique(y))),
+  ntree = 100,
+  do.trace = F
+)
+```
+
+```{r}
+rf.celltype.outer
+```
+
+Select 1k features from 14074 genes. 
+
+bestvar is the variable used to split the node (0 if node is terminal).
+
+```{r}
+rf.celltype.outer.used1k <-
+  names(sort(table(
+    rownames(rf.celltype.outer$importance)[rf.celltype.outer$forest$bestvar[rf.celltype.outer$forest$bestvar !=
+                                                                              0]]
+  ), decreasing = TRUE)[1:1000])
+
+plot(rf.celltype.outer$importance[rf.celltype.outer.used1k, 1])  # correlates to importance measure
+```
+
+
+```{r}
+set.seed(123)
+rf.celltype.inner <- randomForest(
+  x = t(X[rf.celltype.outer.used1k,]),
+  y = y,
+  sampsize = rep(50, length(unique(y))),
+  ntree = 100,
+  do.trace = F
+)
+```
+
+```{r}
+rf.celltype.inner
+```
+
+```{r}
+y_pred_healthy <- predict(rf.celltype.inner, newdata = t(X), type = "prob")
+```
+
+```{r}
+rf.celltype.inner$confusion
+```
+
+earlyEry misclassified as lateEry and Prog.
+Prog misclassified as HSC.
+
+```{r}
+heatmap(rf.celltype.inner$confusion, Rowv = NA, Colv = NA, scale = NULL)
+
+rf.celltype.inner$confusion %>%
+  as.data.frame() %>%
+  rownames_to_column("class") %>%
+  ggplot(aes(x = class, y = class.error)) +
+  geom_bar(stat = "identity")
+```
+
+Predict celltype of malignant AML cells. 
+
+"In four patients (AML314, AML371, AML722B and AML997), for which we detected few mutant transcripts and few high quality cells, we could not confidently assign malignant cells."
+
+I also exclude AML475 and AML420B because they also only have 7 and 6 cells genotyped as malignant (and upon first classification, those cells were lymphoid cells).
+
+```{r}
+galen_aml_donors_malignant <- subset(galen_aml_donors, subset = (genotype == "malignant" & SampleClass != "HealthyDonor"))
+table(galen_aml_donors_malignant$Sample)
+
+selected_samples <- donor_metadata$Sample[!donor_metadata$Sample %in% c("AML314", "AML371", "AML722B", "AML997", "AML475", "AML420B")]
+galen_aml_donors_malignant <- subset(galen_aml_donors_malignant, Sample %in% selected_samples)
+```
+
+
+```{r}
+X_malignant <- galen_aml_donors_malignant@assays$RNA@layers$data
+rownames(X_malignant) <- rownames(galen_aml_donors_malignant)
+X_malignant <- X_malignant[rf.celltype.outer.used1k,]
+
+y_pred_malignant <- predict(rf.celltype.inner, newdata = t(X_malignant), type = "prob")
+
+y_pred_max <- colnames(y_pred_malignant)[max.col(y_pred_malignant)]
+```
+
+
+There are cells classified as lymphocytes, despite detection of mutated transcripts.
+Same for early erythrocytes, pDC. 
+
+```{r}
+table(y_pred_max)
+table(y_pred_max, galen_aml_donors_malignant$Sample)
+t(round(t(table(y_pred_max, galen_aml_donors_malignant$Sample)) / as.vector(colSums(table(y_pred_max, galen_aml_donors_malignant$Sample))), 2))
+```
+
+
+There are some rather unexpected HSPC cell type predictions: early erythroid cells and pDC cells. While lymphoid cell types are pretty surely a misclassification, early ery and pDC can actually be mutated in AML, according to literature. 
+
+https://www.mdpi.com/2072-6694/14/14/3375
+Acute myeloid leukemia (AML) with ≥2% plasmacytoid dendritic cells (pDC) has been recently described as AML with pDC differentiation (pDC-AML) characterized by pDC expansion with frequent RUNX1 mutations.
+
+AML921A has 8% cells predicted as pDC and RUNX1 NM_001754 c.167T>C p.L56S (63.5%, VUS)
+
+In combination with the possible signature combinations in AML cells, I want to keep those predictions. 
+
+However, there are too few cells to use them as classes in a classifier. Instead, I'll include them as features, alongside genes, and predict malignant vs. normal classes. 
+
+I'll only train 1 classifier, instead of inner and outer. 
+This way, validation of correct prediction of malignant cells is more truthful. 
+
+```{r}
+X_healthy <- galen_aml_donors_healthy@assays$RNA@layers$data
+X_healthy <- X_healthy[,!is.na(galen_aml_donors_healthy$backspin_celltype)]
+rownames(X_healthy) <- rownames(galen_aml_donors_healthy)
+# combine celltype prediction with gene expression
+X_healthy_celltype <- rbind(X_healthy, t(y_pred_healthy))
+
+X_malignant <- galen_aml_donors_malignant@assays$RNA@layers$data
+rownames(X_malignant) <- rownames(galen_aml_donors_malignant)
+# combine celltype prediction with gene expression
+X_malignant_celltype <- rbind(X_malignant, t(y_pred_malignant))
+
+X_celltype <- cbind(X_healthy_celltype, X_malignant_celltype)
+dim(X_celltype)
+
+X <- cbind(X_healthy, X_malignant)
+dim(X)
+
+y = factor(c(rep("healthy", ncol(X_healthy)), rep("malignant", ncol(X_malignant))))
+table(y)
+```
+
+Keep cells expressed in >= 1% in at least one of the classes. 
+
+```{r}
+keep.genes.expressed <- rowSums((X > 0) / ncol(X)) >= 0.01
+table(keep.genes.expressed)
+
+# expressed in 1% cells in at least 1 class
+classes <- unique(y)
+keep.genes.class <- lapply(classes, FUN = function(class) {
+  genes <- names(which(rowSums((X[,y == class] > 0) / sum(y == class)) >= 0.01))
+  return(genes)
+})
+keep.genes.class <- rownames(X) %in% unlist(keep.genes.class)
+names(keep.genes.class) <- rownames(X)
+table(keep.genes.class)
+```
+
+```{r}
+X <- X[names(which(keep.genes.class)),]
+X_celltype <- X_celltype[c(names(which(keep.genes.class)), colnames(y_pred_malignant)), ]
+```
+
+Train 1 classifier with celltype probabilities as features and one without. 
+
+```{r}
+set.seed(123)
+rf.malignant <- randomForest(
+  x = t(X),
+  y = y,
+  sampsize = rep(200, length(unique(y))),
+  ntree = 100,
+  do.trace = F
+)
+```
+
+```{r}
+set.seed(123)
+rf.malignant.celltype <- randomForest(
+  x = t(X_celltype),
+  y = y,
+  sampsize = rep(200, length(unique(y))),
+  ntree = 100,
+  do.trace = F
+)
+```
+
+Including cell type probabilities gives a slightly smaller OOB error (6.85% vs. 8.85%).
+
+```{r}
+rf.malignant
+rf.malignant.celltype
+```
+
+```{r}
+y_malignant_celltype_pred <- predict(rf.malignant.celltype, newdata = t(X_celltype), type = "prob")
+```
+
+```{r}
+y_malignant_celltype_pred_max <- colnames(y_malignant_celltype_pred)[max.col(y_malignant_celltype_pred)]
+
+donor_list <- unique(galen_aml_donors_malignant$Sample)
+names(donor_list) <- donor_list
+
+# donor_accuracy_rf.malignant.celltype <- lapply(donor_list, function(donor) sum(y_malignant_celltype_pred_max[donors == donor] == "malignant") / sum(donors == donor))
+# donor_accuracy_rf.malignant.celltype
+```
+
+
+### Model evaluation
+
+#### Cross-validation on AML donors
+
+Pick 4 donors at random (to save time).
+
+Accuracy is how many cells are correctly classified as malignant. 
+
+With this cross validation, we could do more paramter testing. Like the number of features to pick for the inner cell type classifier.
+Or how many paramters to sample for each decision in the tree. Or how many trees to train. Or how many 
+
+```{r}
+donors <- c(galen_aml_donors_healthy$Sample, galen_aml_donors_malignant$Sample)
+table(donors)
+donors_cv <- unique(galen_aml_donors_malignant$Sample, galen_aml_donors_healthy$Sample)
+set.seed(123)
+donors_cv <- sample(donors_cv, size = 4)
+donors_cv
+```
+
+```{r}
+cv_results <- lapply(donors_cv, function(donor) {
+  cat(donor)
+  cat("\n")
+  
+  # train and validation split
+  X_celltype_cv_train <- X_celltype[, donors != donor]
+  X_celltype_cv_test <- X_celltype[, donors == donor]
+  y_cv_train <- y[donors != donor]
+  y_cv_test <- y[donors == donor]
+  
+  # train on test data
+  set.seed(123)
+  rf.malignant.celltype.cv <- randomForest(
+    x = t(X_celltype_cv_train),
+    y = y_cv_train,
+    sampsize = rep(200, length(unique(y_cv_train))),
+    ntree = 100,
+    do.trace = FALSE
+  )
+  
+  # predict validation data
+  y_cv_pred <-
+    predict(
+      rf.malignant.celltype.cv,
+      newdata = t(X_celltype_cv_test),
+      type = "prob"
+    )
+  y_cv_pred_max <- colnames(y_cv_pred)[max.col(y_cv_pred)]
+  
+  # calculate accuracy
+  accuracy <- sum(y_cv_pred_max == y_cv_test) / length(y_cv_pred_max)
+  return(accuracy)
+})
+
+names(cv_results) <- donors_cv
+```
+
+
+
+```{r}
+lapply(cv_results, round, 3)
+```
+
+
+```{r}
+donor_metadata %>%
+  filter(Sample %in% donors_cv, `Days from diagnosis` == "D0") %>%
+  select(Sample, `RHP Mutations`, `Common translocation`) %>%
+  unique()
+```
+
+
+#### Cross-validation on driver mutations
+
+TODO
+
+To test the generalizability of the model on unseen mutations, cross validation should be performed with holding out all samples with a specific driver mutation. 
+
+"To exclude the possibility that the high frequency of cells with detected NPM1 mutations affected the classifier, we generated a separate classifier that does not consider NPM1 mutant calls. This separate classifier had equally high specificity (99.8% of normal cells correctly called normal), and sensitivity (93% of malignant cells correctly called malignant) in 5-fold cross-validation. It is also consistent with the original classifier: 97% of cells originally classified as normal were classified as normal; 91% of cells originally classified as malignant were classified as malignant. These results indicate that the classifier is robust to the frequency of NPM1 mutations in the training set."
+
+Should have put the NPM1 sample in the non-NPM1 trained classifier.
+
+#### External test dataset
+
+scRNA-seq from AML patients (NPM1) with sc genotyping.
+
+Naldini, M.M., Casirati, G., Barcella, M. et al. Longitudinal single-cell profiling of chemotherapy response in acute myeloid leukemia. Nat Commun 14, 1285 (2023). [https://doi.org/10.1038/s41467-023-36969-0](https://www.nature.com/articles/s41467-023-36969-0)
+
+10 patients with NPM1mut AML, present in van Galen dataset.
+Majority of NPM1mut AML sampels in van Galen dataset also have DNMT3 mutation. DNMT3 status is not mentioned for this study. 
+
+3 patients with del(7) AML, not present in van Galen data.
+
+*Preprocessing information*
+Feature-barcodes filtered matrices from Cell Ranger were used as input for Seurat R package64,65 (version 3.2.3). Seurat objects were merged in a single full dataset. Cells with a mitochondrial count ratio higher than 0.2 and <100 or >7000 expressed genes were removed from the dataset. UMI counts were log normalized and scaled for a factor of 10,000.  
+The top 20% most variable genes were selected for downstream analysis. Cell cycle scores were assigned with the CellCycleScoring function using a reference gene lists66. We scaled data and regressed out unwanted variability by passing UMI count, percent of mitochondrial genes and cell cycle difference defined variables to the vars.to.regress argument. Cell cycle difference was defined as the difference between S phase and G/2 M phase module scores. Downstream analysis was performed on the top 100 principal components (PCA). In order to reduce patient-related and 10x chemistry version (v2 vs v3) bias, we performed data integration using the Harmony package (v1.0)24.
+
+*Mutation annotation information*
+NPM1-MF considers the UMI counts supporting either NPM1 mutant or WT allele to classify cells as 
+MUT (≥1 UMI for the mutant allele)
+WT (>5 WT transcripts, no mutant transcripts)
+ND – not detected (cells with ≤ 5 WT transcripts and no mutant transcripts)
+NoCall (cells without coverage over the NPM1 mutation region)
+
+Check patient metadata.  
+Do not provide information on age, Sex or clinincal blast count.
+
+```{r results=F}
+metadata_npm1_patients <- readxl::read_xlsx("naldini_et_al/41467_2023_36969_MOESM5_ESM.xlsx")
+```
+
+
+```{r}
+metadata_npm1_patients
+```
+
+
+Check cell metadata.  
+I can't figure out what the orig.ident (e.g. M03) is. It is the ID used in the expression matrix. So maybe the capture, but it doesn't make much sense to have 9 cells from PT12 and 570 cells from PT13 in M44. Why would there be leakage between captures. 
+
+PT01, PT02, PT13 are primary refractory. 
+PT06, PT07, PT12 are long-term complete remission.
+PT08, PT09, PT10, PT15 are NPM1mut AML relapse post-chemotherapy.
+
+```{r}
+metadata_npm1_cells <- readRDS("naldini_et_al/GSE185991_Full_Patient_metadata.rds")
+head(metadata_npm1_cells)
+```
+
+Check number of genotyped cells per sample to pick one for testing. 
+
+PT02, combining diagnosis and D30 samples, has a lot of WT and MUT cells, NPM1mut, primary refractory. 
+Good patient to test if classifier can extrapolate to other scRNA-seq datasets.
+
+```{r}
+metadata_npm1_patients %>%
+  mutate(Sample = paste(PatientID, Timepoint, sep = "_")) %>%
+  group_by(Sample, Classification) %>%
+  summarize(n_cells = sum(n)) %>%
+  ggplot(aes(x = Sample, y = n_cells, fill = Classification)) +
+  geom_bar(stat = "identity") +
+  theme_bw() +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Captures with PT02 data.
+Not sure why there are only 9 cells in the other capture. 
+
+```{r}
+metadata_npm1_cells %>%
+  filter(PatientID == "PT02") %>%
+  pull(orig.ident) %>%
+  table()
+
+metadata_npm1_cells %>%
+  filter(PatientID == "PT07") %>%
+  pull(orig.ident) %>%
+  table()
+```
+
+Read in count data.
+
+```{r}
+naldini_seurat_m25 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M25/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m25) <- paste0("M25_", gsub("-1", "", colnames(naldini_seurat_m25)))
+
+naldini_seurat_m26 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M26/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m26) <- paste0("M26_", gsub("-1", "", colnames(naldini_seurat_m26)))
+
+# combine captures and merge
+naldini_seurat_pt02 <- cbind(naldini_seurat_m25, naldini_seurat_m26)
+naldini_seurat_pt02 <- CreateSeuratObject(counts = naldini_seurat_pt02, min.cells = 0, min.features = 200)
+ncol(naldini_seurat_pt02)
+
+naldini_seurat_m25 <- NULL
+naldini_seurat_m26 <- NULL
+gc()
+
+# subset to cells present in metadata
+naldini_seurat_pt02 <- subset(naldini_seurat_pt02, cells = rownames(metadata_npm1_cells))
+ncol(naldini_seurat_pt02)
+
+# add metadata to Seurat object
+naldini_seurat_pt02 <- AddMetaData(naldini_seurat_pt02, metadata_npm1_cells)
+table(naldini_seurat_pt02$orig.ident)
+```
+
+```{r}
+naldini_seurat_m21 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M21/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m21) <- paste0("M21_", gsub("-1", "", colnames(naldini_seurat_m21)))
+
+naldini_seurat_m22 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M22/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m22) <- paste0("M22_", gsub("-1", "", colnames(naldini_seurat_m22)))
+
+naldini_seurat_m23 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M23/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m23) <- paste0("M23_", gsub("-1", "", colnames(naldini_seurat_m23)))
+
+naldini_seurat_m24 <- Read10X(
+  data.dir = "naldini_et_al/GSE185991_RAW/M24/",
+  gene.column = 2,
+  cell.column = 1,
+  unique.features = TRUE,
+  strip.suffix = FALSE
+)
+colnames(naldini_seurat_m24) <- paste0("M24_", gsub("-1", "", colnames(naldini_seurat_m24)))
+
+# combine captures and merge
+naldini_seurat_pt07 <- cbind(naldini_seurat_m21, naldini_seurat_m22, naldini_seurat_m23, naldini_seurat_m24)
+naldini_seurat_pt07 <- CreateSeuratObject(counts = naldini_seurat_pt07, min.cells = 0, min.features = 200)
+ncol(naldini_seurat_pt07)
+
+naldini_seurat_m21 <- NULL
+naldini_seurat_m22 <- NULL
+naldini_seurat_m23 <- NULL
+naldini_seurat_m24 <- NULL
+gc()
+
+# subset to cells present in metadata
+naldini_seurat_pt07 <- subset(naldini_seurat_pt07, cells = rownames(metadata_npm1_cells))
+ncol(naldini_seurat_pt07)
+
+# add metadata to Seurat object
+naldini_seurat_pt07 <- AddMetaData(naldini_seurat_pt07, metadata_npm1_cells)
+table(naldini_seurat_pt07$orig.ident)
+```
+
+
+
+Filter cells for >3000 UMI, 1000 genes, <10% mitochondrial transcripts PT02.
+PT07 seems to have lower quality. Use less stringent filters. 
+
+```{r}
+VlnPlot(naldini_seurat_pt02, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"), log = T, pt.size = 0)
+VlnPlot(naldini_seurat_pt07, features = c("nCount_RNA", "nFeature_RNA", "percent.mt"), log = T, pt.size = 0)
+```
+
+Seems like PT02 is female, PT07 is male. 
+
+```{r}
+VlnPlot(naldini_seurat_pt02, features = c("XIST"))
+VlnPlot(naldini_seurat_pt07, features = c("XIST"))
+```
+
+
+```{r}
+naldini_seurat_pt02 <- subset(naldini_seurat_pt02, subset = nCount_RNA > 3000 & nFeature_RNA > 1000 & percent.mt < 10)
+naldini_seurat_pt07 <- subset(naldini_seurat_pt07, subset = nCount_RNA > 1000 & nFeature_RNA > 500 & percent.mt < 10)
+```
+
+
+```{r}
+table(naldini_seurat_pt02$orig.ident)
+table(naldini_seurat_pt07$orig.ident)
+```
+
+```{r}
+naldini_seurat_pt02_pt07 <- merge(naldini_seurat_pt02, naldini_seurat_pt07)
+naldini_seurat_pt02_pt07
+
+naldini_seurat_pt02_pt07 <- merge(naldini_seurat_pt02, y = naldini_seurat_pt07, add.cell.ids = c("PT02", "PT07"), project = "Naldini")
+naldini_seurat_pt02_pt07
+```
+
+Normalize gene expression. 
+
+```{r}
+naldini_seurat_pt02_pt07 <- NormalizeData(naldini_seurat_pt02_pt07)
+```
+
+
+##### Predict HSPC cell type
+
+```{r}
+X <- cbind(naldini_seurat_pt02_pt07@assays$RNA@layers$data.1, naldini_seurat_pt02_pt07@assays$RNA@layers$data.2)
+rownames(X) <- rownames(naldini_seurat_pt02_pt07)
+```
+
+Some features used in classifier are missing in data, either due to gene ID mismatches or because the genes are not expressed. 
+Both van Galen and Naldini were aligned to hg38, so it is more likely lack of expression. 
+Will set missing genes to 0. 
+
+```{r}
+features_missing <- rownames(rf.celltype.inner$importance)[!rownames(rf.celltype.inner$importance) %in% rownames(X)]
+
+features_missing_mat <- matrix(nrow = length(features_missing), ncol = ncol(X), data = 0)
+rownames(features_missing_mat) <- features_missing
+colnames(features_missing_mat) <- colnames(X)
+
+X <- rbind(X, features_missing_mat)
+
+X <- X[rownames(rf.celltype.inner$importance),]
+```
+
+
+```{r}
+naldini_seurat_pt02_pt07_celltype_pred <- predict(rf.celltype.inner, newdata = t(X), type = "prob")
+```
+
+##### Predict malignant cells
+
+```{r}
+X <- cbind(naldini_seurat_pt02_pt07@assays$RNA@layers$data.1, naldini_seurat_pt02_pt07@assays$RNA@layers$data.2)
+X <- rbind(X, t(naldini_seurat_pt02_pt07_celltype_pred))
+rownames(X) <- c(rownames(naldini_seurat_pt02_pt07), colnames(naldini_seurat_pt02_pt07_celltype_pred))
+
+features_missing <- rownames(rf.malignant.celltype$importance)[!rownames(rf.malignant.celltype$importance) %in% rownames(X)]
+features_missing_mat <- matrix(nrow = length(features_missing), ncol = ncol(X), data = 0)
+rownames(features_missing_mat) <- features_missing
+colnames(features_missing_mat) <- colnames(X)
+
+X <- rbind(X, features_missing_mat)
+```
+
+
+```{r}
+naldini_seurat_pt02_pt07_malignant_pred <- predict(rf.malignant.celltype, newdata = t(X), type = "prob")
+
+naldini_seurat_pt02_pt07_malignant_pred_max <- colnames(naldini_seurat_pt02_pt07_malignant_pred)[max.col(naldini_seurat_pt02_pt07_malignant_pred)]
+```
+
+
+##### Results
+
+Compare malignant vs. healthy prediction with genotype data. 
+
+For PT02, 
+99.6% cells genotyped as mutant are predicted as malignant. 
+53.6% cells genotyped as wild type are predicted as normal. 
+
+```{r}
+naldini_seurat_pt02_malignant_pred_max <- naldini_seurat_pt02_pt07_malignant_pred_max[naldini_seurat_pt02_pt07$PatientID == "PT02"]
+table(naldini_seurat_pt02_malignant_pred_max, naldini_seurat_pt02@meta.data$Classification)
+
+round(t(t(table(naldini_seurat_pt02_malignant_pred_max, naldini_seurat_pt02@meta.data$Classification)) / as.vector(table(naldini_seurat_pt02@meta.data$Classification))), 3)
+```
+For PT07, 
+
+```{r}
+naldini_seurat_pt07_malignant_pred_max <- naldini_seurat_pt02_pt07_malignant_pred_max[naldini_seurat_pt02_pt07$PatientID == "PT07"]
+table(naldini_seurat_pt07_malignant_pred_max, naldini_seurat_pt07@meta.data$Classification)
+
+round(t(t(table(naldini_seurat_pt07_malignant_pred_max, naldini_seurat_pt07@meta.data$Classification)) / as.vector(table(naldini_seurat_pt07@meta.data$Classification))), 3)
+```
+
+
+Test on sample with a mutation not present in van Galen data. 
+
+del(7) AML: deletion in chromosome 7. 
+
+Classification of del(7) cells into malignant/wt:  
+"We leveraged the AddModuleScore function for evaluating the expression level of a Chr 7 signature by using as input gene list all genes located on it. The observed distribution of Chr 7 module scores in the datasets followed a bimodal distribution allowing us to classify cells as AML or non-AML by running a k-means clustering (n = 2) on the vector of Chr 7 signature scores and labelling cells in the high score group as non-AML and those in the low score group as AML."
+
+Unfortunately, not included in metadata.
+
+PT11, PT17: refractory disease; PT18: early relapse
+
+```{r}
+metadata_del7_cells <- readRDS("naldini_et_al/GSE185991_AML_Del7_metadata.rds")
+
+table(metadata_del7_cells$orig.ident, metadata_del7_cells$PatientID)
+```
+
+Computing module score with all genes on chr7 might be very slow. 
+
+Download cellranger gtf reference, get all genes on chr7.
+
+```{sh eval=FALSE}
+source="/Users/holzehenrietta/Documents/personal/phd_applications/muds_task_marr/reference_sources"
+mkdir -p "$source"
+gtf_url="http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.primary_assembly.annotation.gtf.gz"
+gtf_in="${source}/gencode.v44.primary_assembly.annotation.gtf"
+
+if [ ! -f "$gtf_in" ]; then
+    curl -sS "$gtf_url" | zcat > "$gtf_in"
+fi
+
+grep "^chr7" $gtf_in | awk '$3 == "gene"' | sed 's/.*gene_name "\([^"]*\)".*/\1/g' > ${source}/gencode.v44_gene_names_chr7.txt
+
+grep "^chrY" $gtf_in | awk '$3 == "gene"' | sed 's/.*gene_name "\([^"]*\)".*/\1/g' > ${source}/gencode.v44_gene_names_chrY.txt
+```
+
+```{r}
+chr7_genes <-
+  read_lines(
+    "/Users/holzehenrietta/Documents/personal/phd_applications/muds_task_marr/reference_sources/gencode.v44_gene_names_chr7.txt"
+  )
+```
+
+Subset to genes expressed in >= 10% of cells in del(7) scRNA-seq data to speed up analysis.
+
+```{r}
+
+```
+
+
+## Save Session Info
+
+```{r}
+writeLines(capture.output(sessionInfo()), paste0(Sys.Date(), "_sessionInfo.txt"))
+```
+
