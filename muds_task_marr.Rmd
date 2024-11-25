@@ -683,10 +683,6 @@ pred_malignant_vs_blast_count %>%
 ```
 
 
-```{r}
-
-```
-
 
 ```{r}
 cor.test(
@@ -1135,31 +1131,6 @@ nomnoml::nomnoml(code = "#direction: down
 ```
 
 
-
-```{r}
-unique(gsub("\\..*", "", unique(galen_aml_donors$MutTranscripts)))
-genes_genotypes <-
-  c(
-    "NRAS",
-    "KRAS",
-    "SF3A1",
-    "NPM1",
-    "DNMT3A",
-    "FLT3",
-    "TP53",
-    "SETD2",
-    "RUNX1",
-    "BCOR",
-    "PTPN11",
-    "SMC3",
-    "IDH2",
-    "TET2",
-    "BRCC3",
-    "KIT",
-    "RAD21"
-  )
-```
-
 ### Transcriptional heterogeneity of malignant and healthy cells
 
 The goal is to develop a classifier of malignant vs. healthy HSPCs and myeloid cells from AML patients, that is generalizable to other AML types with other driver mutations and other scRNA-seq technologies/datasets. 
@@ -1397,6 +1368,39 @@ pb_mds_df_driver_mutation %>%
   coord_equal()
 ```
 
+```{r}
+unique(sampleId_mutation_list$driver_mutation)
+genes_genotypes <-
+  c(
+    "NRAS",
+    "KRAS",
+    "SF3A1",
+    "NOTCH1",
+    "NOTCH2",
+    "SF3A1",
+    "CBFB",
+    "MYH11",
+    "NPM1",
+    "JAK3",
+    "DNMT3A",
+    "FLT3",
+    "TP53",
+    "SETD2",
+    "RUNX1",
+    "BCOR",
+    "BCORL1",
+    "PTPN11",
+    "SMC3",
+    "IDH2",
+    "TET2",
+    "BRCC3",
+    "KIT",
+    "RAD21",
+    "MLL",
+    "CEBPA"
+  )
+```
+
 ### Azimuth projection
 
 Alternative to cell type identification with a random forest model is label transfer from a reference atlas. 
@@ -1526,7 +1530,7 @@ rf.celltype.outer <- randomForest(
   x = t(X),
   y = y,
   sampsize = rep(50, length(unique(y))),
-  ntree = 100,
+  ntree = 200,
   do.trace = F
 )
 ```
@@ -1556,7 +1560,7 @@ rf.celltype.inner <- randomForest(
   x = t(X[rf.celltype.outer.used1k,]),
   y = y,
   sampsize = rep(50, length(unique(y))),
-  ntree = 100,
+  ntree = 200,
   do.trace = F
 )
 ```
@@ -1596,8 +1600,10 @@ I also exclude AML475 and AML420B because they also only have 7 and 6 cells geno
 galen_aml_donors_malignant <- subset(galen_aml_donors, subset = (genotype == "malignant" & SampleClass != "HealthyDonor"))
 table(galen_aml_donors_malignant$Sample)
 
-selected_samples <- donor_metadata$Sample[!donor_metadata$Sample %in% c("AML314", "AML371", "AML722B", "AML997", "AML475", "AML420B")]
-galen_aml_donors_malignant <- subset(galen_aml_donors_malignant, Sample %in% selected_samples)
+selected_samples <-
+  donor_metadata$Sample[!donor_metadata$Sample %in% c("AML314", "AML371", "AML722B", "AML997", "AML475", "AML420B")]
+galen_aml_donors_malignant <-
+  subset(galen_aml_donors_malignant, Sample %in% selected_samples)
 ```
 
 
@@ -1618,7 +1624,11 @@ Same for early erythrocytes, pDC.
 ```{r}
 table(y_pred_max)
 table(y_pred_max, galen_aml_donors_malignant$Sample)
-t(round(t(table(y_pred_max, galen_aml_donors_malignant$Sample)) / as.vector(colSums(table(y_pred_max, galen_aml_donors_malignant$Sample))), 2))
+t(round(t(
+  table(y_pred_max, galen_aml_donors_malignant$Sample)
+) / as.vector(colSums(
+  table(y_pred_max, galen_aml_donors_malignant$Sample)
+)), 2))
 ```
 
 
@@ -1678,9 +1688,10 @@ table(keep.genes.class)
 ```{r}
 X <- X[names(which(keep.genes.class)),]
 X_celltype <- X_celltype[c(names(which(keep.genes.class)), colnames(y_pred_malignant)), ]
+X_celltype_driver <- X_celltype[!rownames(X_celltype) %in% genes_genotypes, ]
 ```
 
-Train 1 classifier with celltype probabilities as features and one without. 
+Train 1 classifier with celltype probabilities as features and one without and one without genes with driver mutations. 
 
 ```{r}
 set.seed(123)
@@ -1688,7 +1699,7 @@ rf.malignant <- randomForest(
   x = t(X),
   y = y,
   sampsize = rep(200, length(unique(y))),
-  ntree = 100,
+  ntree = 200,
   do.trace = F
 )
 ```
@@ -1699,16 +1710,28 @@ rf.malignant.celltype <- randomForest(
   x = t(X_celltype),
   y = y,
   sampsize = rep(200, length(unique(y))),
-  ntree = 100,
+  ntree = 200,
   do.trace = F
 )
 ```
 
-Including cell type probabilities gives a slightly smaller OOB error (6.85% vs. 8.85%).
+```{r}
+set.seed(123)
+rf.malignant.celltype.driver <- randomForest(
+  x = t(X_celltype_driver),
+  y = y,
+  sampsize = rep(200, length(unique(y))),
+  ntree = 200,
+  do.trace = F
+)
+```
+
+Including cell type probabilities gives a 
 
 ```{r}
 rf.malignant
 rf.malignant.celltype
+rf.malignant.celltype.driver
 ```
 
 ```{r}
@@ -1735,7 +1758,7 @@ Pick 4 donors at random (to save time).
 Accuracy is how many cells are correctly classified as malignant. 
 
 With this cross validation, we could do more paramter testing. Like the number of features to pick for the inner cell type classifier.
-Or how many paramters to sample for each decision in the tree. Or how many trees to train. Or how many 
+Or how many paramters to sample for each decision in the tree. Or the depth of the trees. 
 
 ```{r}
 donors <- c(galen_aml_donors_healthy$Sample, galen_aml_donors_malignant$Sample)
@@ -1763,7 +1786,7 @@ cv_results <- lapply(donors_cv, function(donor) {
     x = t(X_celltype_cv_train),
     y = y_cv_train,
     sampsize = rep(200, length(unique(y_cv_train))),
-    ntree = 100,
+    ntree = 200,
     do.trace = FALSE
   )
   
@@ -1784,12 +1807,45 @@ cv_results <- lapply(donors_cv, function(donor) {
 names(cv_results) <- donors_cv
 ```
 
-
+Cross validation when leaving out driver mutation genes. 
 
 ```{r}
-lapply(cv_results, round, 3)
-```
+cv_results_driver <- lapply(donors_cv, function(donor) {
+  cat(donor)
+  cat("\n")
+  
+  # train and validation split
+  X_celltype_cv_train <- X_celltype_driver[, donors != donor]
+  X_celltype_cv_test <- X_celltype_driver[, donors == donor]
+  y_cv_train <- y[donors != donor]
+  y_cv_test <- y[donors == donor]
+  
+  # train on test data
+  set.seed(123)
+  rf.malignant.celltype.cv <- randomForest(
+    x = t(X_celltype_cv_train),
+    y = y_cv_train,
+    sampsize = rep(200, length(unique(y_cv_train))),
+    ntree = 200,
+    do.trace = FALSE
+  )
+  
+  # predict validation data
+  y_cv_pred <-
+    predict(
+      rf.malignant.celltype.cv,
+      newdata = t(X_celltype_cv_test),
+      type = "prob"
+    )
+  y_cv_pred_max <- colnames(y_cv_pred)[max.col(y_cv_pred)]
+  
+  # calculate accuracy
+  accuracy <- sum(y_cv_pred_max == y_cv_test) / length(y_cv_pred_max)
+  return(accuracy)
+})
 
+names(cv_results_driver) <- donors_cv
+```
 
 ```{r}
 donor_metadata %>%
@@ -1797,6 +1853,18 @@ donor_metadata %>%
   select(Sample, `RHP Mutations`, `Common translocation`) %>%
   unique()
 ```
+
+```{r}
+lapply(cv_results, round, 3)
+```
+
+```{r}
+lapply(cv_results_driver, round, 3)
+```
+
+
+Excluding genes with driver mutations increases patient CV accuracy slightly in 3/4 cases.
+
 
 
 #### Cross-validation on driver mutations
@@ -2002,8 +2070,12 @@ VlnPlot(naldini_seurat_pt07, features = c("XIST"))
 
 
 ```{r}
-naldini_seurat_pt02 <- subset(naldini_seurat_pt02, subset = nCount_RNA > 3000 & nFeature_RNA > 1000 & percent.mt < 10)
-naldini_seurat_pt07 <- subset(naldini_seurat_pt07, subset = nCount_RNA > 1000 & nFeature_RNA > 500 & percent.mt < 10)
+naldini_seurat_pt02 <-
+  subset(naldini_seurat_pt02,
+         subset = nCount_RNA > 3000 & nFeature_RNA > 1000 & percent.mt < 10)
+naldini_seurat_pt07 <-
+  subset(naldini_seurat_pt07,
+         subset = nCount_RNA > 1000 & nFeature_RNA > 500 & percent.mt < 10)
 ```
 
 
@@ -2013,10 +2085,17 @@ table(naldini_seurat_pt07$orig.ident)
 ```
 
 ```{r}
-naldini_seurat_pt02_pt07 <- merge(naldini_seurat_pt02, naldini_seurat_pt07)
+naldini_seurat_pt02_pt07 <-
+  merge(naldini_seurat_pt02, naldini_seurat_pt07)
 naldini_seurat_pt02_pt07
 
-naldini_seurat_pt02_pt07 <- merge(naldini_seurat_pt02, y = naldini_seurat_pt07, add.cell.ids = c("PT02", "PT07"), project = "Naldini")
+naldini_seurat_pt02_pt07 <-
+  merge(
+    naldini_seurat_pt02,
+    y = naldini_seurat_pt07,
+    add.cell.ids = c("PT02", "PT07"),
+    project = "Naldini"
+  )
 naldini_seurat_pt02_pt07
 ```
 
@@ -2030,7 +2109,11 @@ naldini_seurat_pt02_pt07 <- NormalizeData(naldini_seurat_pt02_pt07)
 ##### Predict HSPC cell type
 
 ```{r}
-X <- cbind(naldini_seurat_pt02_pt07@assays$RNA@layers$data.1, naldini_seurat_pt02_pt07@assays$RNA@layers$data.2)
+X <-
+  cbind(
+    naldini_seurat_pt02_pt07@assays$RNA@layers$data.1,
+    naldini_seurat_pt02_pt07@assays$RNA@layers$data.2
+  )
 rownames(X) <- rownames(naldini_seurat_pt02_pt07)
 ```
 
@@ -2039,15 +2122,19 @@ Both van Galen and Naldini were aligned to hg38, so it is more likely lack of ex
 Will set missing genes to 0. 
 
 ```{r}
-features_missing <- rownames(rf.celltype.inner$importance)[!rownames(rf.celltype.inner$importance) %in% rownames(X)]
+features_missing <-
+  rownames(rf.celltype.inner$importance)[!rownames(rf.celltype.inner$importance) %in% rownames(X)]
 
-features_missing_mat <- matrix(nrow = length(features_missing), ncol = ncol(X), data = 0)
+features_missing_mat <-
+  matrix(nrow = length(features_missing),
+         ncol = ncol(X),
+         data = 0)
 rownames(features_missing_mat) <- features_missing
 colnames(features_missing_mat) <- colnames(X)
 
 X <- rbind(X, features_missing_mat)
 
-X <- X[rownames(rf.celltype.inner$importance),]
+X <- X[rownames(rf.celltype.inner$importance), ]
 ```
 
 
@@ -2058,12 +2145,24 @@ naldini_seurat_pt02_pt07_celltype_pred <- predict(rf.celltype.inner, newdata = t
 ##### Predict malignant cells
 
 ```{r}
-X <- cbind(naldini_seurat_pt02_pt07@assays$RNA@layers$data.1, naldini_seurat_pt02_pt07@assays$RNA@layers$data.2)
+X <-
+  cbind(
+    naldini_seurat_pt02_pt07@assays$RNA@layers$data.1,
+    naldini_seurat_pt02_pt07@assays$RNA@layers$data.2
+  )
 X <- rbind(X, t(naldini_seurat_pt02_pt07_celltype_pred))
-rownames(X) <- c(rownames(naldini_seurat_pt02_pt07), colnames(naldini_seurat_pt02_pt07_celltype_pred))
+rownames(X) <-
+  c(
+    rownames(naldini_seurat_pt02_pt07),
+    colnames(naldini_seurat_pt02_pt07_celltype_pred)
+  )
 
-features_missing <- rownames(rf.malignant.celltype$importance)[!rownames(rf.malignant.celltype$importance) %in% rownames(X)]
-features_missing_mat <- matrix(nrow = length(features_missing), ncol = ncol(X), data = 0)
+features_missing <-
+  rownames(rf.malignant.celltype$importance)[!rownames(rf.malignant.celltype$importance) %in% rownames(X)]
+features_missing_mat <-
+  matrix(nrow = length(features_missing),
+         ncol = ncol(X),
+         data = 0)
 rownames(features_missing_mat) <- features_missing
 colnames(features_missing_mat) <- colnames(X)
 
@@ -2072,9 +2171,13 @@ X <- rbind(X, features_missing_mat)
 
 
 ```{r}
-naldini_seurat_pt02_pt07_malignant_pred <- predict(rf.malignant.celltype, newdata = t(X), type = "prob")
+naldini_seurat_pt02_pt07_malignant_pred <-
+  predict(rf.malignant.celltype,
+          newdata = t(X),
+          type = "prob")
 
-naldini_seurat_pt02_pt07_malignant_pred_max <- colnames(naldini_seurat_pt02_pt07_malignant_pred)[max.col(naldini_seurat_pt02_pt07_malignant_pred)]
+naldini_seurat_pt02_pt07_malignant_pred_max <-
+  colnames(naldini_seurat_pt02_pt07_malignant_pred)[max.col(naldini_seurat_pt02_pt07_malignant_pred)]
 ```
 
 
@@ -2082,23 +2185,39 @@ naldini_seurat_pt02_pt07_malignant_pred_max <- colnames(naldini_seurat_pt02_pt07
 
 Compare malignant vs. healthy prediction with genotype data. 
 
-For PT02, 
-99.6% cells genotyped as mutant are predicted as malignant. 
-53.6% cells genotyped as wild type are predicted as normal. 
-
 ```{r}
 naldini_seurat_pt02_malignant_pred_max <- naldini_seurat_pt02_pt07_malignant_pred_max[naldini_seurat_pt02_pt07$PatientID == "PT02"]
-table(naldini_seurat_pt02_malignant_pred_max, naldini_seurat_pt02@meta.data$Classification)
+table(
+  naldini_seurat_pt02_malignant_pred_max,
+  naldini_seurat_pt02@meta.data$Classification
+)
 
-round(t(t(table(naldini_seurat_pt02_malignant_pred_max, naldini_seurat_pt02@meta.data$Classification)) / as.vector(table(naldini_seurat_pt02@meta.data$Classification))), 3)
+round(t(t(
+  table(
+    naldini_seurat_pt02_malignant_pred_max,
+    naldini_seurat_pt02@meta.data$Classification
+  )
+) / as.vector(
+  table(naldini_seurat_pt02@meta.data$Classification)
+)), 3)
 ```
-For PT07, 
 
 ```{r}
-naldini_seurat_pt07_malignant_pred_max <- naldini_seurat_pt02_pt07_malignant_pred_max[naldini_seurat_pt02_pt07$PatientID == "PT07"]
-table(naldini_seurat_pt07_malignant_pred_max, naldini_seurat_pt07@meta.data$Classification)
+naldini_seurat_pt07_malignant_pred_max <-
+  naldini_seurat_pt02_pt07_malignant_pred_max[naldini_seurat_pt02_pt07$PatientID == "PT07"]
+table(
+  naldini_seurat_pt07_malignant_pred_max,
+  naldini_seurat_pt07@meta.data$Classification
+)
 
-round(t(t(table(naldini_seurat_pt07_malignant_pred_max, naldini_seurat_pt07@meta.data$Classification)) / as.vector(table(naldini_seurat_pt07@meta.data$Classification))), 3)
+round(t(t(
+  table(
+    naldini_seurat_pt07_malignant_pred_max,
+    naldini_seurat_pt07@meta.data$Classification
+  )
+) / as.vector(
+  table(naldini_seurat_pt07@meta.data$Classification)
+)), 3)
 ```
 
 
